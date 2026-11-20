@@ -1,6 +1,6 @@
 # Jera Snapback
 
-Jera and Ansuz share one Snapback 4 data service. This repository owns its Quarry schema, server-side validation, ATproto OAuth gateways, application record definitions, operation clients for integration tests, and host operations. Jera supplies the private drafts, posts, audiences and module graph. Ansuz supplies the immutable gesture recordings, reader grants and trace validation. A verified DID owns each person's records. All new posts and recordings stay in this application store.
+Jera and Ansuz share one Snapback 4 data service. This repository owns its Quarry schema, server-side validation, ATproto OAuth gateways, application record definitions, operation clients for integration tests, and host operations. Jera supplies the private drafts, posts, audiences and module graph. Ansuz supplies the immutable gesture recordings, reader grants and trace validation. A verified DID owns each person's records. Jera Public and Personal posts and Ansuz recordings stay in this application store. The dedicated Bluesky view publishes explicitly submitted text to the account’s PDS through the Jera gateway.
 
 ## Run locally
 
