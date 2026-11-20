@@ -13,7 +13,7 @@ const callback = 'studio.zojer.jera.exact:/oauth';
 
 // Stub only the already-verified OAuth boundary. These tests do not prove real
 // PDS authorization; they exercise Jera's handoff and session custody over HTTP.
-async function fixture(t, searchAccounts, callbacks = [callback]) {
+async function fixture(t, searchAccounts, callbacks = [callback], profile = 'jera') {
   const store = new AuthStore(':memory:');
   let minted = 0, revoked = 0, authority = true;
   const client = {
@@ -22,13 +22,15 @@ async function fixture(t, searchAccounts, callbacks = [callback]) {
       // A fresh browser has no provider sessions. Bluesky refuses select_account
       // in that case; ordinary interactive authorization must remain possible.
       if (options.prompt === 'select_account' || options.prompt === 'none') throw new Error('account_selection_required');
+      store.set('requested-scope', options.state, options.scope);
       return new URL(`https://identity.example/authorize?state=${options.state}`);
     },
     callback: async params => {
       if (params.get('proof') !== 'verified-by-test-sdk') throw Object.assign(new Error('invalid OAuth callback'), { status: 2 });
+      store.set('verified-scope', did, store.get('requested-scope', params.get('state')));
       return { session: { did }, state: params.get('state') };
     },
-    restore: async sub => { assert.equal(sub, did); if (!authority) throw new TokenRevokedError(did); },
+    restore: async sub => { assert.equal(sub, did); if (!authority) throw new TokenRevokedError(did); return { did, getTokenInfo: async () => ({ sub: did, scope: store.get('verified-scope', did) }) }; },
   };
   const upstream = async (url, options) => {
     if (url.endsWith('/auth/session')) {
@@ -44,14 +46,14 @@ async function fixture(t, searchAccounts, callbacks = [callback]) {
     }
     throw new Error('Unexpected backend operation');
   };
-  const server = createServer(createHandler({ client, store, publicOrigin: 'http://127.0.0.1', callbacks, snapbackOrigin: 'http://backend.test', serviceToken: 'server-only', searchAccounts, fetcher: upstream }));
+  const server = createServer(createHandler({ profile, client, store, publicOrigin: 'http://127.0.0.1', callbacks, snapbackOrigin: 'http://backend.test', serviceToken: 'server-only', searchAccounts, fetcher: upstream }));
   server.listen(0, '127.0.0.1'); await once(server, 'listening');
   t.after(() => { server.closeAllConnections(); server.close(); store.close(); });
   const origin = `http://127.0.0.1:${server.address().port}`;
   const post = (path, value, headers = {}) => fetch(origin + path, { method: 'POST', headers: { 'content-type': 'application/json', ...headers }, body: JSON.stringify(value) });
-  async function start(target = callback) {
+  async function start(target = callback, purpose = '') {
     const verifier = token(), state = token();
-    const response = await fetch(`${origin}/oauth/start?handle=alice.test&state=${state}&challenge=${digest(verifier)}&callback=${encodeURIComponent(target)}`, { redirect: 'manual' });
+    const response = await fetch(`${origin}/oauth/start?purpose=${purpose}&handle=${purpose ? did : 'alice.test'}&state=${state}&challenge=${digest(verifier)}&callback=${encodeURIComponent(target)}`, { redirect: 'manual' });
     assert.equal(response.status, 302);
     return { state, verifier, cookie: response.headers.get('set-cookie').split(';')[0] };
   }
@@ -143,4 +145,35 @@ test('SDK failures with a non-HTTP status cannot crash the server or expose deta
   assert.equal(r.status, 400);
   assert.ok(!(await r.text()).includes('not-for-errors'));
   assert.equal((await fetch(f.origin + '/oauth/health')).status, 200);
+});
+
+test('posting consent binds the verified OAuth DID to the existing Jera session without minting a second account session', async t => {
+  const f = await fixture(t);
+  const header = { authorization: 'Bearer private-session' };
+  assert.equal((await (await f.post('/oauth/posting-status', { did }, header)).json()).enabled, false);
+  assert.equal((await f.post('/records/bluesky', { did }, header)).status, 403);
+  const flow = await f.start(callback, 'bluesky');
+  assert.equal(f.store.get('requested-scope', flow.state), 'atproto repo:app.bsky.feed.post?action=create');
+  const back = new URL((await f.finish(flow)).headers.get('location'));
+  const result = await f.post('/oauth/exchange', { state: flow.state, verifier: flow.verifier, code: back.searchParams.get('code') }, header);
+  assert.deepEqual(await result.json(), { did, enabled: true });
+  assert.equal(f.minted(), 0);
+  assert.equal((await (await f.post('/oauth/posting-status', { did }, header)).json()).enabled, true);
+  assert.equal((await f.post('/records/bluesky', { did: 'did:plc:' + 'b'.repeat(24) }, header)).status, 403);
+  f.store.set('verified-scope', did, 'atproto');
+  assert.equal((await f.post('/records/bluesky', { did }, header)).status, 403);
+});
+
+test('Ansuz keeps identity-only sign-in and cannot initiate Bluesky posting', async t => {
+  const f = await fixture(t, undefined, [callback], 'ansuz');
+  const flow = await f.start();
+  assert.equal(f.store.get('requested-scope', flow.state), 'atproto');
+  const state = token();
+  const start = new URL('/oauth/start', f.origin);
+  start.search = new URLSearchParams({ purpose: 'bluesky', handle: did, state, challenge: digest(token()), callback });
+  assert.equal((await fetch(start, { redirect: 'manual' })).status, 403);
+  assert.equal(f.store.get('requested-scope', state), undefined);
+  for (const path of ['/oauth/posting-status', '/records/bluesky']) {
+    assert.equal((await f.post(path, { did }, { authorization: 'Bearer private-session' })).status, 404);
+  }
 });
