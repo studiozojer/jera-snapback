@@ -38,7 +38,7 @@ const client = new NodeOAuthClient({
     token_endpoint_auth_method: 'private_key_jwt', token_endpoint_auth_signing_alg: 'ES256',
     dpop_bound_access_tokens: true, jwks_uri: `${publicOrigin}/oauth/jwks.json`,
   },
-  keyset: [key], requestLock: requestLocalLock, stateStore: store.sdk('oauth-state', 10 * 60000), sessionStore: store.sdk('oauth-session'),
+  keyset: [key], requestLock: requestLocalLock, stateStore: store.sdk('oauth-state', 10 * 60000), sessionStore: store.sdk('oauth-session', jera ? 90 * 86400000 : undefined),
 });
 const serviceToken = (await readFile(setting('SERVICE_TOKEN_FILE') ?? resolve(directory, 'service-token'), 'utf8')).trim();
 if (!serviceToken) throw new Error('Missing Snapback service token.');

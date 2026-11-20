@@ -1,6 +1,7 @@
 import { TokenRefreshError, TokenRevokedError } from '@atproto/oauth-client-node';
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { archiveHandler } from './archive.mjs';
+import { DAY, deviceSessions } from './device-sessions.mjs';
 import { postScope, hasPostScope, publishBluesky } from './bluesky.mjs';
 import { createRecordHandler } from './records.mjs';
 
@@ -38,7 +39,10 @@ export function createHandler({ client, store, publicOrigin, callbacks, snapback
     if (!token) fail('Sign in again.', 401);
     const { data } = await upstream('/q/currentIdentity', token, { args: {} });
     const did = data?.did;
-    if (!validDid(did)) fail('Sign in with your ATproto account.', 401);
+    if (!validDid(did)) {
+      if (profile === 'jera') fail('Could not verify the account identity. Try again.', 503);
+      fail('Sign in with your ATproto account.', 401);
+    }
     // Force a refresh to observe revocation on restore/renewal. Transport errors
     // preserve the local session; only definite loss of OAuth authority revokes it.
     try { await client.restore(did, true); }
@@ -50,6 +54,18 @@ export function createHandler({ client, store, publicOrigin, callbacks, snapback
       fail('Could not check account authorization. Try again when connected.', 503);
     }
     return did;
+  }
+  async function mint(did, days) {
+    const { session } = await upstream('/auth/session', serviceToken, { principal: did, kind: 'account', days });
+    if (session?.principal !== did) fail('Unexpected account binding.', 502);
+    return session;
+  }
+  const devices = deviceSessions({ store, upstream, check, fail });
+  function postingGrantKey(token) {
+    // A remembered installation keeps consent across rotations, including when
+    // its former bearer expired while the phone was asleep.
+    const deviceKey = devices.keyForAccess(token);
+    return deviceKey ? 'device:' + deviceKey : digest(token);
   }
   const records = createRecordHandler({ authenticate: check, snapbackOrigin, serviceToken, fetcher });
   return async (req, res) => {
@@ -78,7 +94,7 @@ export function createHandler({ client, store, publicOrigin, callbacks, snapback
         const did = await check(bearer);
         const input = await body(req, 24000);
         if (input?.did !== did) fail('The posting account changed.', 403);
-        const enabledHere = store.get('bluesky-grant', digest(bearer)) === did;
+        const enabledHere = store.get('bluesky-grant', postingGrantKey(bearer)) === did;
         const session = enabledHere ? await client.restore(did) : null;
         const enabled = Boolean(session && await hasPostScope(session, did));
         if (url.pathname === '/oauth/posting-status') return json(res, 200, { did, enabled });
@@ -135,7 +151,7 @@ export function createHandler({ client, store, publicOrigin, callbacks, snapback
         res.writeHead(302, { location: back.toString() }); return res.end();
       }
       if (req.method === 'POST' && url.pathname === '/oauth/exchange') {
-        const { state, code, verifier } = await body(req);
+        const { state, code, verifier, rememberDevice } = await body(req);
         if (![state, code, verifier].every(validNonce)) fail();
         const flow = store.get('flow', state);
         if (!flow || flow.phase !== 'complete' || !equal(flow.code, digest(code)) || !equal(flow.challenge, digest(verifier))) fail();
@@ -146,15 +162,25 @@ export function createHandler({ client, store, publicOrigin, callbacks, snapback
           const did = await check(bearer);
           if (did !== flow.did || did !== flow.postingDid || !await hasPostScope(await client.restore(did), did))
             fail('Posting permission was not granted for this account.', 403);
-          store.set('bluesky-grant', digest(bearer), did);
+          const key = postingGrantKey(bearer);
+          store.set('bluesky-grant', key, did, key.startsWith('device:') ? 90 * DAY : undefined);
           return json(res, 200, { did, enabled: true });
         }
-        const result = await upstream('/auth/session', serviceToken, { principal: flow.did, kind: 'account', days: 1 });
-        if (result.session?.principal !== flow.did) fail('Unexpected account binding.', 502);
-        return json(res, 200, { session: result.session });
+        if (rememberDevice === true && profile === 'jera') {
+          const platform = flow.callback === 'studio.zojer.jera.exact:/oauth' ? 'ios' : 'web';
+          return json(res, 200, await devices.enroll(flow.did, platform, mint));
+        }
+        return json(res, 200, { session: await mint(flow.did, 1) });
+      }
+      if (req.method === 'POST' && profile === 'jera' && ['/oauth/device/session', '/oauth/device/logout'].includes(url.pathname)) {
+        const credential = req.headers.authorization?.match(/^Bearer (.+)$/)?.[1];
+        if (url.pathname === '/oauth/device/session') return json(res, 200, await devices.resume(credential, mint));
+        await devices.end(credential);
+        return json(res, 200, { ok: true });
       }
       if (req.method === 'POST' && ['/oauth/check', '/auth/refresh'].includes(url.pathname)) {
         const token = req.headers.authorization?.match(/^Bearer (.+)$/)?.[1];
+        if (profile === 'jera' && url.pathname === '/auth/refresh' && devices.managed(token)) fail('Renew through the remembered device.', 403);
         const did = await check(token);
         if (url.pathname === '/oauth/check') return json(res, 200, { did });
         const renewed = await upstream('/auth/refresh', token, {});

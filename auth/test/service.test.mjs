@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { once } from 'node:events';
 import { TokenRevokedError } from '@atproto/oauth-client-node';
 import { AuthStore } from '../store.mjs';
@@ -16,6 +16,7 @@ const callback = 'studio.zojer.jera.exact:/oauth';
 async function fixture(t, searchAccounts, callbacks = [callback], profile = 'jera') {
   const store = new AuthStore(':memory:');
   let minted = 0, revoked = 0, authority = true;
+  const sessions = new Set(['private-session']);
   const client = {
     clientMetadata: { scope: 'atproto' }, jwks: { keys: [] },
     authorize: async (handle, options) => {
@@ -37,11 +38,17 @@ async function fixture(t, searchAccounts, callbacks = [callback], profile = 'jer
       assert.equal(options.headers.authorization, 'Bearer server-only');
       assert.equal(JSON.parse(options.body).principal, did);
       minted++;
-      return Response.json({ session: { principal: did, token: 'private-session', kind: 'account', expiresAt: Date.now() + 86400000 } });
+      const bearer = 'minted-' + minted;
+      sessions.add(bearer);
+      return Response.json({ session: { principal: did, token: bearer, kind: 'account', expiresAt: Date.now() + JSON.parse(options.body).days * 86400000 } });
+    }
+    if (url.endsWith('/auth/logout')) {
+      sessions.delete(options.headers.authorization.slice(7));
+      return Response.json({ ok: true });
     }
     if (url.endsWith('/auth/revoke')) { revoked++; return Response.json({ revoked: 1 }); }
     if (url.endsWith('/q/currentIdentity')) {
-      if (options.headers.authorization !== 'Bearer private-session') return Response.json({ denied: { code: 'E_AUTH' } }, { status: 401 });
+      if (!sessions.has(options.headers.authorization.slice(7))) return Response.json({ denied: { code: 'E_AUTH' } }, { status: 401 });
       return Response.json({ data: { did } });
     }
     throw new Error('Unexpected backend operation');
@@ -147,6 +154,29 @@ test('SDK failures with a non-HTTP status cannot crash the server or expose deta
   assert.equal((await fetch(f.origin + '/oauth/health')).status, 200);
 });
 
+test('only an opted-in Jera exchange enrolls a device and the verified callback selects its policy', async t => {
+  const web = 'https://jera.ink/.exact/auth/callback';
+  for (const [profile, target, days] of [['jera', callback, 1], ['jera', web, 30], ['ansuz', callback, 1]]) {
+    const f = await fixture(t, undefined, [callback, web], profile);
+    const flow = await f.start(target);
+    const back = new URL((await f.finish(flow)).headers.get('location'));
+    const response = await f.post('/oauth/exchange', {state:flow.state, verifier:flow.verifier, code:back.searchParams.get('code'), rememberDevice:true});
+    assert.equal(response.status, 200);
+    const {session, deviceCredential, deviceExpiresAt} = await response.json();
+    assert.equal(Math.round((session.expiresAt - Date.now()) / 86400000), days);
+    if (profile === 'ansuz') {
+      assert.equal(deviceCredential, undefined);
+      continue;
+    }
+    assert.equal(Math.round((deviceExpiresAt - Date.now()) / 86400000), target === web ? 30 : 90);
+    const headers = {authorization:'Bearer ' + deviceCredential};
+    assert.equal((await f.post('/oauth/device/session', {}, headers)).status, 200);
+    assert.equal((await f.post('/auth/refresh', {}, {authorization:'Bearer ' + session.token})).status, 403);
+    assert.equal((await f.post('/oauth/device/logout', {}, headers)).status, 200);
+    assert.equal((await f.post('/oauth/device/session', {}, headers)).status, 401);
+  }
+});
+
 test('posting consent binds the verified OAuth DID to the existing Jera session without minting a second account session', async t => {
   const f = await fixture(t);
   const header = { authorization: 'Bearer private-session' };
@@ -176,4 +206,29 @@ test('Ansuz keeps identity-only sign-in and cannot initiate Bluesky posting', as
   for (const path of ['/oauth/posting-status', '/records/bluesky']) {
     assert.equal((await f.post(path, { did }, { authorization: 'Bearer private-session' })).status, 404);
   }
+});
+
+test('remembered posting consent survives rotation on the authorized phone only', async t => {
+  const f = await fixture(t);
+  async function exchange(purpose, bearer) {
+    const flow = await f.start(callback, purpose);
+    const back = new URL((await f.finish(flow)).headers.get('location'));
+    const response = await f.post('/oauth/exchange', { state: flow.state, verifier: flow.verifier, code: back.searchParams.get('code'), rememberDevice: true }, bearer ? { authorization: 'Bearer ' + bearer } : {});
+    assert.equal(response.status, 200);
+    return response.json();
+  }
+  const phone = await exchange('');
+  const second = await exchange('');
+  assert.deepEqual(await exchange('bluesky', phone.session.token), { did, enabled: true });
+  const key = createHash('sha256').update(phone.deviceCredential).digest('hex');
+  const device = f.store.get('device', key);
+  device.access.expiresAt = Date.now();
+  f.store.set('device', key, device);
+  const resumed = await f.post('/oauth/device/session', {}, { authorization: 'Bearer ' + phone.deviceCredential });
+  const { session } = await resumed.json();
+  assert.notEqual(session.token, phone.session.token);
+  const status = token => f.post('/oauth/posting-status', { did }, { authorization: 'Bearer ' + token });
+  assert.equal((await (await status(session.token)).json()).enabled, true);
+  assert.equal((await (await status(second.session.token)).json()).enabled, false);
+  assert.equal((await status(phone.session.token)).status, 401);
 });
