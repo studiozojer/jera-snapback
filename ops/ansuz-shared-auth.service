@@ -1,0 +1,27 @@
+[Unit]
+Description=Ansuz ATproto authorization for the shared Snapback store
+After=network-online.target jera-snapback.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=jera-snapback
+Group=jera-snapback
+WorkingDirectory=/opt/jera-snapback/auth
+Environment=ANSUZ_AUTH_DATA=/var/lib/jera-snapback/ansuz-auth
+Environment=ANSUZ_PUBLIC_ORIGIN=https://ansuz.jera.ink
+Environment="ANSUZ_AUTH_CALLBACKS=studio.zojer.ansuz:/oauth,http://127.0.0.1:8768/.exact/auth/callback"
+Environment=SNAPBACK_ORIGIN=http://127.0.0.1:4417
+ExecStart=/opt/jera-snapback/runtime/bin/node /opt/jera-snapback/auth/server.mjs ansuz
+Restart=on-failure
+RestartSec=3
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/jera-snapback/ansuz-auth
+MemoryMax=512M
+
+[Install]
+WantedBy=multi-user.target

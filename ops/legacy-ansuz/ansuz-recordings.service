@@ -1,0 +1,27 @@
+[Unit]
+Description=Ansuz recordings API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ansuz-recordings
+Group=ansuz-recordings
+WorkingDirectory=/opt/ansuz-recordings
+Environment=PATH=/opt/ansuz-recordings/runtime/bin:/usr/bin:/bin
+ExecStart=/opt/ansuz-recordings/node_modules/.bin/snapback4 serve /var/lib/ansuz-recordings/deployment --bind 127.0.0.1 --port 4431
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=45
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/ansuz-recordings
+LimitNOFILE=8192
+MemoryMax=1G
+CPUQuota=150%
+
+[Install]
+WantedBy=multi-user.target

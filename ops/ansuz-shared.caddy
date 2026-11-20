@@ -1,0 +1,24 @@
+# Explicit hostname takes precedence over the PDS handle wildcard.
+ansuz.jera.ink {
+    tls force_automate
+    encode zstd gzip
+    header {
+        X-Content-Type-Options nosniff
+        -Server
+    }
+    @oauth path /oauth/* /auth/refresh /records/* /m/archive
+    handle @oauth {
+        reverse_proxy 127.0.0.1:4433
+    }
+    # Minting authority remains loopback-only even with a stolen service token.
+    @administration path /auth/session /auth/revoke /auth/delete-account /m/commitStructuredPost
+    handle @administration {
+        respond "Not available" 403
+    }
+    handle {
+        reverse_proxy 127.0.0.1:4417 {
+            header_up -x-snapback-persona
+            flush_interval -1
+        }
+    }
+}

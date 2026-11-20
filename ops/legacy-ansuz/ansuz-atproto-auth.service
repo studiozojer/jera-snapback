@@ -1,0 +1,26 @@
+[Unit]
+Description=Ansuz ATproto account authorization
+After=network-online.target ansuz-recordings.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ansuz-recordings
+Group=ansuz-recordings
+WorkingDirectory=/opt/ansuz-recordings/auth
+Environment=ANSUZ_AUTH_DATA=/var/lib/ansuz-recordings/auth
+Environment=ANSUZ_PUBLIC_ORIGIN=https://ansuz.jera.ink
+Environment="ANSUZ_AUTH_CALLBACKS=studio.zojer.ansuz:/oauth,http://127.0.0.1:8768/.exact/auth/callback"
+ExecStart=/opt/ansuz-recordings/runtime/bin/node /opt/ansuz-recordings/auth/server.mjs
+Restart=on-failure
+RestartSec=3
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/ansuz-recordings/auth
+MemoryMax=512M
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,21 @@
+{
+  "name": "jera-snapback",
+  "private": true,
+  "dependencies": {
+    "snapback4": "0.4.33"
+  },
+  "overrides": {
+    "undici": "8.12.2"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "dev": "snapback4 dev --port 4417",
+    "check": "snapback4 check",
+    "test": "node --test tests/*.test.mjs auth/test/*.test.mjs",
+    "auth:jera": "node auth/server.mjs",
+    "auth:ansuz": "node auth/server.mjs ansuz"
+  }
+}
