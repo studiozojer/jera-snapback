@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { once } from 'node:events';
 import { TokenRevokedError } from '@atproto/oauth-client-node';
 import { AuthStore } from '../store.mjs';
@@ -16,43 +16,51 @@ const callback = 'studio.zojer.jera.exact:/oauth';
 async function fixture(t, searchAccounts, callbacks = [callback], profile = 'jera') {
   const store = new AuthStore(':memory:');
   let minted = 0, revoked = 0, authority = true;
+  const sessions = new Set(['private-session']);
   const client = {
     clientMetadata: { scope: 'atproto' }, jwks: { keys: [] },
     authorize: async (handle, options) => {
       // A fresh browser has no provider sessions. Bluesky refuses select_account
       // in that case; ordinary interactive authorization must remain possible.
       if (options.prompt === 'select_account' || options.prompt === 'none') throw new Error('account_selection_required');
+      store.set('requested-scope', options.state, options.scope);
       return new URL(`https://identity.example/authorize?state=${options.state}`);
     },
     callback: async params => {
       if (params.get('proof') !== 'verified-by-test-sdk') throw Object.assign(new Error('invalid OAuth callback'), { status: 2 });
+      store.set('verified-scope', did, store.get('requested-scope', params.get('state')));
       return { session: { did }, state: params.get('state') };
     },
-    restore: async sub => { assert.equal(sub, did); if (!authority) throw new TokenRevokedError(did); },
+    restore: async sub => { assert.equal(sub, did); if (!authority) throw new TokenRevokedError(did); return { did, getTokenInfo: async () => ({ sub: did, scope: store.get('verified-scope', did) }) }; },
   };
   const upstream = async (url, options) => {
     if (url.endsWith('/auth/session')) {
       assert.equal(options.headers.authorization, 'Bearer server-only');
       assert.equal(JSON.parse(options.body).principal, did);
       minted++;
-      return Response.json({ session: { principal: did, token: 'private-session', kind: 'account', expiresAt: Date.now() + JSON.parse(options.body).days * 86400000 } });
+      const bearer = 'minted-' + minted;
+      sessions.add(bearer);
+      return Response.json({ session: { principal: did, token: bearer, kind: 'account', expiresAt: Date.now() + JSON.parse(options.body).days * 86400000 } });
     }
-    if (url.endsWith('/auth/logout')) return Response.json({ ok: true });
+    if (url.endsWith('/auth/logout')) {
+      sessions.delete(options.headers.authorization.slice(7));
+      return Response.json({ ok: true });
+    }
     if (url.endsWith('/auth/revoke')) { revoked++; return Response.json({ revoked: 1 }); }
     if (url.endsWith('/q/currentIdentity')) {
-      if (options.headers.authorization !== 'Bearer private-session') return Response.json({ denied: { code: 'E_AUTH' } }, { status: 401 });
+      if (!sessions.has(options.headers.authorization.slice(7))) return Response.json({ denied: { code: 'E_AUTH' } }, { status: 401 });
       return Response.json({ data: { did } });
     }
     throw new Error('Unexpected backend operation');
   };
-  const server = createServer(createHandler({ client, store, profile, publicOrigin: 'http://127.0.0.1', callbacks, snapbackOrigin: 'http://backend.test', serviceToken: 'server-only', searchAccounts, fetcher: upstream }));
+  const server = createServer(createHandler({ profile, client, store, publicOrigin: 'http://127.0.0.1', callbacks, snapbackOrigin: 'http://backend.test', serviceToken: 'server-only', searchAccounts, fetcher: upstream }));
   server.listen(0, '127.0.0.1'); await once(server, 'listening');
   t.after(() => { server.closeAllConnections(); server.close(); store.close(); });
   const origin = `http://127.0.0.1:${server.address().port}`;
   const post = (path, value, headers = {}) => fetch(origin + path, { method: 'POST', headers: { 'content-type': 'application/json', ...headers }, body: JSON.stringify(value) });
-  async function start(target = callback) {
+  async function start(target = callback, purpose = '') {
     const verifier = token(), state = token();
-    const response = await fetch(`${origin}/oauth/start?handle=alice.test&state=${state}&challenge=${digest(verifier)}&callback=${encodeURIComponent(target)}`, { redirect: 'manual' });
+    const response = await fetch(`${origin}/oauth/start?purpose=${purpose}&handle=${purpose ? did : 'alice.test'}&state=${state}&challenge=${digest(verifier)}&callback=${encodeURIComponent(target)}`, { redirect: 'manual' });
     assert.equal(response.status, 302);
     return { state, verifier, cookie: response.headers.get('set-cookie').split(';')[0] };
   }
@@ -167,4 +175,60 @@ test('only an opted-in Jera exchange enrolls a device and the verified callback 
     assert.equal((await f.post('/oauth/device/logout', {}, headers)).status, 200);
     assert.equal((await f.post('/oauth/device/session', {}, headers)).status, 401);
   }
+});
+
+test('posting consent binds the verified OAuth DID to the existing Jera session without minting a second account session', async t => {
+  const f = await fixture(t);
+  const header = { authorization: 'Bearer private-session' };
+  assert.equal((await (await f.post('/oauth/posting-status', { did }, header)).json()).enabled, false);
+  assert.equal((await f.post('/records/bluesky', { did }, header)).status, 403);
+  const flow = await f.start(callback, 'bluesky');
+  assert.equal(f.store.get('requested-scope', flow.state), 'atproto repo:app.bsky.feed.post?action=create');
+  const back = new URL((await f.finish(flow)).headers.get('location'));
+  const result = await f.post('/oauth/exchange', { state: flow.state, verifier: flow.verifier, code: back.searchParams.get('code') }, header);
+  assert.deepEqual(await result.json(), { did, enabled: true });
+  assert.equal(f.minted(), 0);
+  assert.equal((await (await f.post('/oauth/posting-status', { did }, header)).json()).enabled, true);
+  assert.equal((await f.post('/records/bluesky', { did: 'did:plc:' + 'b'.repeat(24) }, header)).status, 403);
+  f.store.set('verified-scope', did, 'atproto');
+  assert.equal((await f.post('/records/bluesky', { did }, header)).status, 403);
+});
+
+test('Ansuz keeps identity-only sign-in and cannot initiate Bluesky posting', async t => {
+  const f = await fixture(t, undefined, [callback], 'ansuz');
+  const flow = await f.start();
+  assert.equal(f.store.get('requested-scope', flow.state), 'atproto');
+  const state = token();
+  const start = new URL('/oauth/start', f.origin);
+  start.search = new URLSearchParams({ purpose: 'bluesky', handle: did, state, challenge: digest(token()), callback });
+  assert.equal((await fetch(start, { redirect: 'manual' })).status, 403);
+  assert.equal(f.store.get('requested-scope', state), undefined);
+  for (const path of ['/oauth/posting-status', '/records/bluesky']) {
+    assert.equal((await f.post(path, { did }, { authorization: 'Bearer private-session' })).status, 404);
+  }
+});
+
+test('remembered posting consent survives rotation on the authorized phone only', async t => {
+  const f = await fixture(t);
+  async function exchange(purpose, bearer) {
+    const flow = await f.start(callback, purpose);
+    const back = new URL((await f.finish(flow)).headers.get('location'));
+    const response = await f.post('/oauth/exchange', { state: flow.state, verifier: flow.verifier, code: back.searchParams.get('code'), rememberDevice: true }, bearer ? { authorization: 'Bearer ' + bearer } : {});
+    assert.equal(response.status, 200);
+    return response.json();
+  }
+  const phone = await exchange('');
+  const second = await exchange('');
+  assert.deepEqual(await exchange('bluesky', phone.session.token), { did, enabled: true });
+  const key = createHash('sha256').update(phone.deviceCredential).digest('hex');
+  const device = f.store.get('device', key);
+  device.access.expiresAt = Date.now();
+  f.store.set('device', key, device);
+  const resumed = await f.post('/oauth/device/session', {}, { authorization: 'Bearer ' + phone.deviceCredential });
+  const { session } = await resumed.json();
+  assert.notEqual(session.token, phone.session.token);
+  const status = token => f.post('/oauth/posting-status', { did }, { authorization: 'Bearer ' + token });
+  assert.equal((await (await status(session.token)).json()).enabled, true);
+  assert.equal((await (await status(second.session.token)).json()).enabled, false);
+  assert.equal((await status(phone.session.token)).status, 401);
 });

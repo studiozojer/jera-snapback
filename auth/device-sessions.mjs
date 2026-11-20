@@ -29,7 +29,9 @@ export function deviceSessions({ store, upstream, check, fail, now = Date.now })
   function save(key, device) {
     const { idle } = policies[device.platform];
     store.set('device', key, device, idle * DAY);
-    store.set('device-access', hash(device.access.token), true, Math.max(1, device.access.expiresAt - now()));
+    const grantKey = 'device:' + key;
+    if (store.get('bluesky-grant', grantKey) === device.did) store.set('bluesky-grant', grantKey, device.did, idle * DAY);
+    store.set('device-access', hash(device.access.token), key, Math.max(1, device.access.expiresAt - now()));
   }
   function validate(session, did) {
     if (!session?.token || session.principal !== did || !Number.isFinite(session.expiresAt) || session.expiresAt <= now())
@@ -37,6 +39,7 @@ export function deviceSessions({ store, upstream, check, fail, now = Date.now })
     return session;
   }
   return {
+    keyForAccess(token) { return token && store.get('device-access', hash(token)); },
     managed(token) { return Boolean(token && store.get('device-access', hash(token))); },
     async enroll(did, platform, mint) {
       const { idle, access } = policies[platform];
@@ -92,6 +95,7 @@ export function deviceSessions({ store, upstream, check, fail, now = Date.now })
         // upstream logout after an interrupted request or gateway restart.
         save(key, { ...device, ending: true });
         await Promise.all([device.anchor, device.access, device.retiring].filter(Boolean).map(close));
+        store.del('bluesky-grant', 'device:' + key);
         store.del('device', key);
       });
     },

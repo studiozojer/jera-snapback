@@ -150,6 +150,9 @@ test('remembered devices renew across sleep and respect logout, revocation and i
   assert.equal(Math.round((phone.session.expiresAt - began) / DAY), 1);
   assert.equal(Math.round((web.session.expiresAt - began) / DAY), 30);
   assert.equal(devices.managed(phone.session.token), true);
+  const grant = 'device:' + devices.keyForAccess(phone.session.token);
+  store.set('bluesky-grant', grant, did, 90 * DAY);
+  assert.notEqual(devices.keyForAccess(phone.session.token), devices.keyForAccess(web.session.token));
   await assert.rejects(identity(phone.deviceCredential), revoked);
   await advance(3);
   store.close();
@@ -158,6 +161,8 @@ test('remembered devices renew across sleep and respect logout, revocation and i
   await assert.rejects(identity(phone.session.token), revoked);
   const [first, retry] = await Promise.all([devices.resume(phone.deviceCredential, mint), devices.resume(phone.deviceCredential, mint)]);
   assert.equal(first.session.token, retry.session.token);
+  assert.equal('device:' + devices.keyForAccess(first.session.token), grant);
+  assert.equal(store.get('bluesky-grant', grant), did);
   assert.equal(await identity(retry.session.token), did);
   // The phone lost the successful response, and the gateway restarted.
   store.close();
