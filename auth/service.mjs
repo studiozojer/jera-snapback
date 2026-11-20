@@ -33,7 +33,10 @@ export function createHandler({ client, store, publicOrigin, callbacks, snapback
     if (!token) fail('Sign in again.', 401);
     const { data } = await upstream('/q/currentIdentity', token, { args: {} });
     const did = data?.did;
-    if (!validDid(did)) fail('Could not verify the account identity. Try again.', 503);
+    if (!validDid(did)) {
+      if (profile === 'jera') fail('Could not verify the account identity. Try again.', 503);
+      fail('Sign in with your ATproto account.', 401);
+    }
     // Force a refresh to observe revocation on restore/renewal. Transport errors
     // preserve the local session; only definite loss of OAuth authority revokes it.
     try { await client.restore(did, true); }
@@ -138,7 +141,7 @@ export function createHandler({ client, store, publicOrigin, callbacks, snapback
       }
       if (req.method === 'POST' && ['/oauth/check', '/auth/refresh'].includes(url.pathname)) {
         const token = req.headers.authorization?.match(/^Bearer (.+)$/)?.[1];
-        if (url.pathname === '/auth/refresh' && devices.managed(token)) fail('Renew through the remembered device.', 403);
+        if (profile === 'jera' && url.pathname === '/auth/refresh' && devices.managed(token)) fail('Renew through the remembered device.', 403);
         const did = await check(token);
         return json(res, 200, url.pathname === '/auth/refresh' ? await upstream('/auth/refresh', token, {}) : { did });
       }
