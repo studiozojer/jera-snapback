@@ -102,10 +102,23 @@ mutation probePostInsert(intent: text 26..26, body: text <=12000, deleted: bool)
   assert.equal(branch.root,pub.id);
   assert(!rows(await a.query('postsList')).some(p=>p.id===branch.id),'public author gains no implicit private access');
   assert(!rows(await o.query('postsList')).some(p=>p.id===branch.id));
+  const feed = async (client, visibility, c) => client.query('feedRoots', {visibility, ...(c ? {c} : {})});
+  const publicCard = (await feed(b, 'public')).data.find(row => row.id === pub.id);
+  assert.equal(publicCard.replyCount, 0, 'private branch excluded from public count');
+  const privateCards = (await feed(b, 'private')).data;
+  assert.deepEqual(privateCards.map(row => row.id), [branch.id, priv.id]);
+  assert.deepEqual(privateCards[0].parentInfo, {author: alice.did, visibility: 'public'});
+  assert.deepEqual(privateCards[1].audienceInfo, {name: 'Private', kind: 'shared'});
+  assert.equal(privateCards[1].replyCount, 1);
+  assert.deepEqual((await feed(o, 'private')).data, []);
+  assert.deepEqual((await o.query('threadPosts', {root: pub.id})).data, []);
+  assert.deepEqual((await b.query('threadPosts', {root: pub.id})).data.map(row => row.id), [branch.id]);
   await refused(o.mutate('setAudienceMember',{audience:audience.id,principal:outsider.did,access:'reply'}),'NOT_OWNER');
   await refused(a.mutate('setAudienceMember',{audience:audience.id,principal:alice.did,access:'read'}),'OWNER_MEMBERSHIP');
   await refused(a.mutate('publishPost',{body:'   ',visibility:'public',audience:null,parent:null}),'E_INPUT');
   await a.mutate('removeAudienceMember',{audience:audience.id,principal:bob.did});
+  assert.deepEqual((await feed(b, 'private')).data.map(row => row.id), [branch.id]);
+  assert.deepEqual((await b.query('threadPosts', {root: priv.id})).data, []);
   const afterRevoke=rows(await b.query('postsList'));
   assert(!afterRevoke.some(p=>p.id===priv.id||p.id===child.id),'revocation also denies the revoked author’s descendant');
   await refused(b.mutate('publishPost',args),'PARENT_UNAVAILABLE');
@@ -115,6 +128,8 @@ mutation probePostInsert(intent: text 26..26, body: text <=12000, deleted: bool)
   await refused(o.mutate('deletePost',{id:child.id}),'NOT_FOUND');
   assert.deepEqual((await b.mutate('deletePost',{id:child.id})).result,{id:child.id,deleted:true});
   assert.equal((await a.query('postById',{id:child.id})).data.body,'');
+  assert.equal((await feed(a, 'private')).data.find(row => row.id === priv.id).replyCount, 0);
+  assert.equal((await a.query('threadPosts', {root: priv.id})).data[0].deleted, true);
   await a.mutate('setAudienceMember',{audience:audience.id,principal:bob.did,access:'read'});
   assert(rows(await b.query('postsList')).some(p=>p.id===child.id));
   await refused(b.mutate('publishPost',args),'REPLY_NOT_ALLOWED');
@@ -131,6 +146,20 @@ mutation probePostInsert(intent: text 26..26, body: text <=12000, deleted: bool)
   const removed=(await a.query('postById',{id:pub.id})).data;
   assert.equal(removed.deleted,true);assert.equal(removed.body,'');
   assert.equal((await b.query('postById',{id:branch.id})).data.body,'Bob’s private branch on Alice’s public post','deleting a parent preserves another author’s replies');
+  assert.deepEqual((await feed(a, 'public')).data, []);
+  // A sparse selected feed is not starved by newer posts of another visibility.
+  const publicRoots = [];
+  for (let i = 0; i < 30; i++) {
+    const row = (await a.mutate('publishPost', {body: 'Page fixture', visibility: 'public', audience: null, parent: null})).result;
+    publicRoots.push(row);
+  }
+  const first = await feed(a, 'public');
+  assert.equal(first.data.length, 25);
+  assert.ok(first.next);
+  const second = await feed(a, 'public', first.next);
+  const orderedIds = publicRoots.sort((lhs, rhs) => rhs.at - lhs.at || rhs.id.localeCompare(lhs.id)).map(row => row.id);
+  assert.deepEqual([...first.data, ...second.data].map(row => row.id), orderedIds);
+  assert.deepEqual((await feed(b, 'private')).data.map(row => row.id), [branch.id, priv.id]);
   const replay=(await a.request('/m/publishPost',{id:intentId(),args:{intent:pub.intent,body:'Public ♍︎ ♍️ :virgo:',visibility:'public',audience:null,parent:null}})).result;
   assert.equal(replay.id,pub.id);assert.equal(replay.deleted,true);assert.equal(replay.body,'','late publication cannot resurrect deleted text');
   await refused(b.mutate('publishPost',{body:'Reply to removed post',visibility:'public',audience:null,parent:pub.id}),'PARENT_DELETED');

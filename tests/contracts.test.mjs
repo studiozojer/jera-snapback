@@ -80,6 +80,7 @@ test('real store: legacy adoption, gateway validation, two audience kinds, attri
   const oldArgs = { intent: oldIntent, body: 'Legacy original', visibility: 'private', audience: oldAudience.id, parent: null };
   const oldPost = (await owner.client.mutate('publishPost', oldArgs)).result;
   const oldPublic=(await owner.client.mutate('publishPost',{intent:intentId(),body:'Historical public post',visibility:'public',audience:null,parent:null})).result;
+  await owner.client.mutate('publishPost', { ...oldArgs, intent: intentId(), body: 'Legacy reply', parent: oldPost.id });
   assert.equal((await owner.client.query('postById', { id: oldPost.id })).data.body, 'Legacy original', 'pre-upgrade row is readable');
   await owner.client.mutate('saveSocialDraft', { deviceKey, scope: 'root:private', body: 'Unpublished original', revision: 7 });
 
@@ -101,6 +102,9 @@ mutation probeOwnerMember(audience: audiences, principal: principal):
   for (const person of people) person.client.origin = backend.url;
   assert.equal((await owner.client.query('postById', { id: oldPost.id })).data.lexicon, null);
   assert.equal((await operator.client.query('postById', { id: oldPost.id })).data.body, 'Legacy original');
+  const adopted = (await operator.client.query('feedRoots', {visibility: 'private'})).data;
+  assert.deepEqual(adopted.map(row => [row.id, row.replyCount]), [[oldPost.id, 1]], 'adoption rebuilds counts for preexisting replies');
+  assert.deepEqual((await outsider.client.query('feedRoots', {visibility: 'private'})).data, []);
   assert.equal((await owner.client.query('audienceList')).data[0].kind, 'shared');
   assert.equal((await owner.client.query('draftForDevice', { deviceKey, scope: 'root:private' })).data.body, 'Unpublished original');
   assert.equal((await owner.client.mutate('publishPost', oldArgs)).result.id, oldPost.id, 'legacy intent survives adoption');
