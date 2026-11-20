@@ -112,3 +112,65 @@ test('real Snapback: capture, organize, query, isolate, replay and recover', { t
   await denied(op.mutate('capture', args), 'E_RULE');
   assert.equal(rows(await op.query('nodesList', { module: mod.id })).length, 2);
 });
+
+test('remembered devices renew across sleep and respect logout, revocation and inactivity on real Snapback', {timeout: 90000}, async t => {
+  const { AuthStore } = await import('../auth/store.mjs');
+  const { deviceSessions, DAY } = await import('../auth/device-sessions.mjs');
+  const dir = await mkdtemp(resolve(tmpdir(), 'jera-device-sessions-'));
+  await mkdir(resolve(dir, 'snapback'));
+  await copyFile(resolve(root, 'snapback/schema.q'), resolve(dir, 'snapback/schema.q'));
+  const store = new AuthStore(':memory:');
+  let server;
+  t.after(async () => { store.close(); if (server) await server.stop(); await rm(dir, { recursive: true, force: true }); });
+  server = await start(dir);
+  const service = execFileSync(cli, ['token', '--service', 'device-tests', '--days', '365'], {cwd:dir, encoding:'utf8', stdio:['ignore','pipe','pipe']}).trim();
+  const did = 'did:plc:' + 'a'.repeat(24);
+  const began = Date.now();
+  t.mock.timers.enable({ apis: ['Date'], now: began });
+  async function advance(days) {
+    await server.stop();
+    server = await start(dir, ['--clock-offset', '+' + days * 24 + 'h']);
+    t.mock.timers.setTime(began + days * DAY);
+  }
+  const upstream = async (path, token, body) => {
+    const response = await fetch(server.url + path, {method:'POST', headers:{authorization:'Bearer ' + token, 'content-type':'application/json'}, body:JSON.stringify(body)});
+    const result = await response.json();
+    if (!response.ok || result.denied) throw Object.assign(new Error('Backend refusal'), {status: response.status});
+    return result;
+  };
+  const mint = async (principal, days) => (await upstream('/auth/session', service, {principal, kind:'account', days})).session;
+  const identity = async token => (await upstream('/q/currentIdentity', token, {args:{}})).data.did;
+  const api = () => deviceSessions({store, upstream, check:identity, fail:(message,status) => {throw Object.assign(new Error(message),{status});}});
+  let devices = api();
+  const phone = await devices.enroll(did, 'ios', mint);
+  const web = await devices.enroll(did, 'web', mint);
+  const idle = await devices.enroll(did, 'ios', mint);
+  const revoked = error => error.status === 401;
+  assert.equal(Math.round((phone.session.expiresAt - began) / DAY), 1);
+  assert.equal(Math.round((web.session.expiresAt - began) / DAY), 30);
+  assert.equal(devices.managed(phone.session.token), true);
+  await assert.rejects(identity(phone.deviceCredential), revoked);
+  await advance(3);
+  devices = api(); // Recreate the gateway from its persisted state.
+  await assert.rejects(identity(phone.session.token), revoked);
+  const [first, retry] = await Promise.all([devices.resume(phone.deviceCredential, mint), devices.resume(phone.deviceCredential, mint)]);
+  assert.equal(first.session.token, retry.session.token);
+  assert.equal(await identity(retry.session.token), did);
+  // The phone lost the successful response, and the gateway restarted.
+  devices = api();
+  assert.equal((await devices.resume(phone.deviceCredential, mint)).session.token, first.session.token);
+  assert.equal((await devices.resume(web.deviceCredential, mint)).session.token, web.session.token);
+  await advance(24);
+  const rotated = await devices.resume(web.deviceCredential, mint);
+  assert.notEqual(rotated.session.token, web.session.token);
+  await assert.rejects(identity(web.session.token), revoked);
+  await devices.end(web.deviceCredential);
+  await assert.rejects(identity(rotated.session.token), revoked);
+  await assert.rejects(devices.resume(web.deviceCredential, mint), revoked);
+  await advance(91);
+  await assert.rejects(devices.resume(idle.deviceCredential, mint), revoked);
+  assert.equal(await identity((await devices.resume(phone.deviceCredential, mint)).session.token), did);
+  await advance(95);
+  await upstream('/auth/revoke', service, {principal:did});
+  await assert.rejects(devices.resume(phone.deviceCredential, mint), revoked);
+});

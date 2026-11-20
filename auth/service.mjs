@@ -1,6 +1,7 @@
 import { TokenRefreshError, TokenRevokedError } from '@atproto/oauth-client-node';
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { archiveHandler } from './archive.mjs';
+import { deviceSessions } from './device-sessions.mjs';
 import { createRecordHandler } from './records.mjs';
 
 const ttl = 10 * 60_000;
@@ -32,7 +33,7 @@ export function createHandler({ client, store, publicOrigin, callbacks, snapback
     if (!token) fail('Sign in again.', 401);
     const { data } = await upstream('/q/currentIdentity', token, { args: {} });
     const did = data?.did;
-    if (!validDid(did)) fail('Sign in with your ATproto account.', 401);
+    if (!validDid(did)) fail('Could not verify the account identity. Try again.', 503);
     // Force a refresh to observe revocation on restore/renewal. Transport errors
     // preserve the local session; only definite loss of OAuth authority revokes it.
     try { await client.restore(did, true); }
@@ -45,6 +46,12 @@ export function createHandler({ client, store, publicOrigin, callbacks, snapback
     }
     return did;
   }
+  async function mint(did, days) {
+    const { session } = await upstream('/auth/session', serviceToken, { principal: did, kind: 'account', days });
+    if (session?.principal !== did) fail('Unexpected account binding.', 502);
+    return session;
+  }
+  const devices = deviceSessions({ store, upstream, check, fail });
   const records = createRecordHandler({ authenticate: check, snapbackOrigin, serviceToken, fetcher });
   return async (req, res) => {
     res.setHeader('Cache-Control', 'no-store');
@@ -111,18 +118,27 @@ export function createHandler({ client, store, publicOrigin, callbacks, snapback
         res.writeHead(302, { location: back.toString() }); return res.end();
       }
       if (req.method === 'POST' && url.pathname === '/oauth/exchange') {
-        const { state, code, verifier } = await body(req);
+        const { state, code, verifier, rememberDevice } = await body(req);
         if (![state, code, verifier].every(validNonce)) fail();
         const flow = store.get('flow', state);
         if (!flow || flow.phase !== 'complete' || !equal(flow.code, digest(code)) || !equal(flow.challenge, digest(verifier))) fail();
         // No await between read and consume: concurrent requests cannot both mint.
         store.del('flow', state);
-        const result = await upstream('/auth/session', serviceToken, { principal: flow.did, kind: 'account', days: 1 });
-        if (result.session?.principal !== flow.did) fail('Unexpected account binding.', 502);
-        return json(res, 200, { session: result.session });
+        if (rememberDevice === true && profile === 'jera') {
+          const platform = flow.callback === 'studio.zojer.jera.exact:/oauth' ? 'ios' : 'web';
+          return json(res, 200, await devices.enroll(flow.did, platform, mint));
+        }
+        return json(res, 200, { session: await mint(flow.did, 1) });
+      }
+      if (req.method === 'POST' && profile === 'jera' && ['/oauth/device/session', '/oauth/device/logout'].includes(url.pathname)) {
+        const credential = req.headers.authorization?.match(/^Bearer (.+)$/)?.[1];
+        if (url.pathname === '/oauth/device/session') return json(res, 200, await devices.resume(credential, mint));
+        await devices.end(credential);
+        return json(res, 200, { ok: true });
       }
       if (req.method === 'POST' && ['/oauth/check', '/auth/refresh'].includes(url.pathname)) {
         const token = req.headers.authorization?.match(/^Bearer (.+)$/)?.[1];
+        if (url.pathname === '/auth/refresh' && devices.managed(token)) fail('Renew through the remembered device.', 403);
         const did = await check(token);
         return json(res, 200, url.pathname === '/auth/refresh' ? await upstream('/auth/refresh', token, {}) : { did });
       }

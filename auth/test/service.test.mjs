@@ -13,7 +13,7 @@ const callback = 'studio.zojer.jera.exact:/oauth';
 
 // Stub only the already-verified OAuth boundary. These tests do not prove real
 // PDS authorization; they exercise Jera's handoff and session custody over HTTP.
-async function fixture(t, searchAccounts, callbacks = [callback]) {
+async function fixture(t, searchAccounts, callbacks = [callback], profile = 'jera') {
   const store = new AuthStore(':memory:');
   let minted = 0, revoked = 0, authority = true;
   const client = {
@@ -35,8 +35,9 @@ async function fixture(t, searchAccounts, callbacks = [callback]) {
       assert.equal(options.headers.authorization, 'Bearer server-only');
       assert.equal(JSON.parse(options.body).principal, did);
       minted++;
-      return Response.json({ session: { principal: did, token: 'private-session', kind: 'account', expiresAt: Date.now() + 86400000 } });
+      return Response.json({ session: { principal: did, token: 'private-session', kind: 'account', expiresAt: Date.now() + JSON.parse(options.body).days * 86400000 } });
     }
+    if (url.endsWith('/auth/logout')) return Response.json({ ok: true });
     if (url.endsWith('/auth/revoke')) { revoked++; return Response.json({ revoked: 1 }); }
     if (url.endsWith('/q/currentIdentity')) {
       if (options.headers.authorization !== 'Bearer private-session') return Response.json({ denied: { code: 'E_AUTH' } }, { status: 401 });
@@ -44,7 +45,7 @@ async function fixture(t, searchAccounts, callbacks = [callback]) {
     }
     throw new Error('Unexpected backend operation');
   };
-  const server = createServer(createHandler({ client, store, publicOrigin: 'http://127.0.0.1', callbacks, snapbackOrigin: 'http://backend.test', serviceToken: 'server-only', searchAccounts, fetcher: upstream }));
+  const server = createServer(createHandler({ client, store, profile, publicOrigin: 'http://127.0.0.1', callbacks, snapbackOrigin: 'http://backend.test', serviceToken: 'server-only', searchAccounts, fetcher: upstream }));
   server.listen(0, '127.0.0.1'); await once(server, 'listening');
   t.after(() => { server.closeAllConnections(); server.close(); store.close(); });
   const origin = `http://127.0.0.1:${server.address().port}`;
@@ -143,4 +144,27 @@ test('SDK failures with a non-HTTP status cannot crash the server or expose deta
   assert.equal(r.status, 400);
   assert.ok(!(await r.text()).includes('not-for-errors'));
   assert.equal((await fetch(f.origin + '/oauth/health')).status, 200);
+});
+
+test('only an opted-in Jera exchange enrolls a device and the verified callback selects its policy', async t => {
+  const web = 'https://jera.ink/.exact/auth/callback';
+  for (const [profile, target, days] of [['jera', callback, 1], ['jera', web, 30], ['ansuz', callback, 1]]) {
+    const f = await fixture(t, undefined, [callback, web], profile);
+    const flow = await f.start(target);
+    const back = new URL((await f.finish(flow)).headers.get('location'));
+    const response = await f.post('/oauth/exchange', {state:flow.state, verifier:flow.verifier, code:back.searchParams.get('code'), rememberDevice:true});
+    assert.equal(response.status, 200);
+    const {session, deviceCredential, deviceExpiresAt} = await response.json();
+    assert.equal(Math.round((session.expiresAt - Date.now()) / 86400000), days);
+    if (profile === 'ansuz') {
+      assert.equal(deviceCredential, undefined);
+      continue;
+    }
+    assert.equal(Math.round((deviceExpiresAt - Date.now()) / 86400000), target === web ? 30 : 90);
+    const headers = {authorization:'Bearer ' + deviceCredential};
+    assert.equal((await f.post('/oauth/device/session', {}, headers)).status, 200);
+    assert.equal((await f.post('/auth/refresh', {}, {authorization:'Bearer ' + session.token})).status, 403);
+    assert.equal((await f.post('/oauth/device/logout', {}, headers)).status, 200);
+    assert.equal((await f.post('/oauth/device/session', {}, headers)).status, 401);
+  }
 });
