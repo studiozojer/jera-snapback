@@ -119,7 +119,8 @@ test('remembered devices renew across sleep and respect logout, revocation and i
   const dir = await mkdtemp(resolve(tmpdir(), 'jera-device-sessions-'));
   await mkdir(resolve(dir, 'snapback'));
   await copyFile(resolve(root, 'snapback/schema.q'), resolve(dir, 'snapback/schema.q'));
-  const store = new AuthStore(':memory:');
+  const storePath = resolve(dir, 'auth.sqlite');
+  let store = new AuthStore(storePath);
   let server;
   t.after(async () => { store.close(); if (server) await server.stop(); await rm(dir, { recursive: true, force: true }); });
   server = await start(dir);
@@ -151,12 +152,16 @@ test('remembered devices renew across sleep and respect logout, revocation and i
   assert.equal(devices.managed(phone.session.token), true);
   await assert.rejects(identity(phone.deviceCredential), revoked);
   await advance(3);
-  devices = api(); // Recreate the gateway from its persisted state.
+  store.close();
+  store = new AuthStore(storePath);
+  devices = api();
   await assert.rejects(identity(phone.session.token), revoked);
   const [first, retry] = await Promise.all([devices.resume(phone.deviceCredential, mint), devices.resume(phone.deviceCredential, mint)]);
   assert.equal(first.session.token, retry.session.token);
   assert.equal(await identity(retry.session.token), did);
   // The phone lost the successful response, and the gateway restarted.
+  store.close();
+  store = new AuthStore(storePath);
   devices = api();
   assert.equal((await devices.resume(phone.deviceCredential, mint)).session.token, first.session.token);
   assert.equal((await devices.resume(web.deviceCredential, mint)).session.token, web.session.token);
