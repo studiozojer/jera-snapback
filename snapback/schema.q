@@ -340,6 +340,17 @@ mutation saveStructuredDraft(deviceKey: text 26..26, scope: text 1..200, body: t
 
 query postsList(c: cursor ?):
   return posts last 100 by .at after c
+-- Children of a private parent inherit its audience. Public cards show only
+-- public replies. Each group carries the same read grant as its source rows.
+view feedReplyCounts: count posts where not .deleted and .parent != null by .parent, .visibility, .audience
+  read <- .visibility = 'public' or exists audiences[.audience, owner = viewer] or exists audienceMembers[.audience, viewer] or viewer = 'service:atproto-auth'
+shape feedCard = { *, parentInfo: posts[.parent] { author, visibility }, audienceInfo: audiences[.audience] { name, kind }, replyCount: feedReplyCounts[.id, .visibility, .audience] }
+query feedRoots(visibility: enum('public', 'private'), c: cursor ?):
+  if visibility = 'public':
+    return posts where .visibility = 'public' and not .deleted and .parent = null last 25 by .at after c feedCard
+  return posts where .visibility = 'private' and not .deleted and (.parent = null or exists posts[.parent, visibility = 'public']) last 25 by .at after c feedCard
+query threadPosts(root: posts, c: cursor ?):
+  return posts where .root = root first 100 by .at after c
 query postById(id: posts):
   return posts[id]
 query postForIntent(intent: text 26..26):
